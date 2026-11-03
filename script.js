@@ -27,9 +27,261 @@ document.addEventListener('DOMContentLoaded', () => {
     const aiEmptyText = document.getElementById('ai-empty-text');
 
     // ---------------------------------------------------------
+    // Admin Authorization & Modal Elements
+    // ---------------------------------------------------------
+    const adminAuthBtn = document.getElementById('admin-auth-btn');
+    const adminBanner = document.getElementById('admin-banner');
+    const adminLogoutBtn = document.getElementById('admin-logout-btn');
+    const adminModal = document.getElementById('admin-modal');
+    const adminModalClose = document.getElementById('admin-modal-close');
+    const adminModalCancel = document.getElementById('admin-modal-cancel');
+    const adminLoginForm = document.getElementById('admin-login-form');
+    const adminKeyInput = document.getElementById('admin-key-input');
+    const adminModalError = document.getElementById('admin-modal-error');
+    const portalToast = document.getElementById('portal-toast');
+
+    let toastTimer = null;
+
+    // ---------------------------------------------------------
+    // Toast Notification Utility
+    // ---------------------------------------------------------
+    function showToast(message, type = 'info') {
+        if (!portalToast) return;
+        portalToast.textContent = message;
+        portalToast.className = `portal-toast ${type}`;
+        portalToast.classList.remove('hidden');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => {
+            portalToast.classList.add('hidden');
+        }, 4000);
+    }
+
+    // ---------------------------------------------------------
+    // Safe JSON Fetch Helper (Handles Empty & Non-JSON Responses)
+    // ---------------------------------------------------------
+    async function safeFetchJson(url, options = {}) {
+        let response;
+        try {
+            response = await fetch(url, options);
+        } catch (netErr) {
+            const err = new Error('Network error. Unable to connect to server. Please check your connection.');
+            err.isNetwork = true;
+            throw err;
+        }
+
+        const contentType = (response.headers.get('content-type') || '').toLowerCase();
+        let text = '';
+        try {
+            text = await response.text();
+        } catch (readErr) {
+            text = '';
+        }
+
+        let data = null;
+        if (text && (contentType.includes('application/json') || text.trim().startsWith('{') || text.trim().startsWith('['))) {
+            try {
+                data = JSON.parse(text);
+            } catch (parseErr) {
+                data = null;
+            }
+        }
+
+        if (!response.ok) {
+            let errorMsg = '';
+            if (data && typeof data === 'object' && data.message) {
+                errorMsg = data.message;
+            } else if (response.status === 404) {
+                errorMsg = 'Requested resource not found.';
+            } else if (response.status === 403 || response.status === 401) {
+                errorMsg = 'Unauthorized: Administrative credentials are required or invalid.';
+            } else if (response.status >= 500) {
+                errorMsg = 'The server encountered an error while processing the request.';
+            } else {
+                errorMsg = `Server returned status ${response.status}.`;
+            }
+            const err = new Error(errorMsg);
+            err.status = response.status;
+            err.data = data;
+            throw err;
+        }
+
+        if (data === null) {
+            return { success: true };
+        }
+        return data;
+    }
+
+    // ---------------------------------------------------------
+    // Admin Authorization State Management
+    // ---------------------------------------------------------
+    function getAdminKey() {
+        return sessionStorage.getItem('campus_admin_key') || '';
+    }
+
+    function isAdminLoggedIn() {
+        return Boolean(getAdminKey());
+    }
+
+    function setAdminKey(key) {
+        if (key && key.trim()) {
+            sessionStorage.setItem('campus_admin_key', key.trim());
+        } else {
+            sessionStorage.removeItem('campus_admin_key');
+        }
+        updateAdminUIState();
+        fetchItems();
+    }
+
+    function updateAdminUIState() {
+        const loggedIn = isAdminLoggedIn();
+        if (adminAuthBtn) {
+            if (loggedIn) {
+                adminAuthBtn.innerHTML = '🔓 Staff Mode (Active)';
+                adminAuthBtn.classList.add('active');
+            } else {
+                adminAuthBtn.innerHTML = '🔐 Staff Login';
+                adminAuthBtn.classList.remove('active');
+            }
+        }
+        if (adminBanner) {
+            if (loggedIn) {
+                adminBanner.classList.remove('hidden');
+            } else {
+                adminBanner.classList.add('hidden');
+            }
+        }
+    }
+
+    function openAdminModal() {
+        if (adminModal) {
+            adminModal.classList.remove('hidden');
+            if (adminModalError) adminModalError.classList.add('hidden');
+            if (adminKeyInput) {
+                adminKeyInput.value = '';
+                setTimeout(() => adminKeyInput.focus(), 50);
+            }
+        }
+    }
+
+    function closeAdminModal() {
+        if (adminModal) {
+            adminModal.classList.add('hidden');
+        }
+    }
+
+    if (adminAuthBtn) {
+        adminAuthBtn.addEventListener('click', () => {
+            if (isAdminLoggedIn()) {
+                if (window.confirm('You are currently logged in as Staff. Do you want to log out?')) {
+                    setAdminKey('');
+                    showToast('Logged out of Staff Mode.', 'info');
+                }
+            } else {
+                openAdminModal();
+            }
+        });
+    }
+
+    if (adminLogoutBtn) {
+        adminLogoutBtn.addEventListener('click', () => {
+            setAdminKey('');
+            showToast('Logged out of Staff Mode.', 'info');
+        });
+    }
+
+    if (adminModalClose) adminModalClose.addEventListener('click', closeAdminModal);
+    if (adminModalCancel) adminModalCancel.addEventListener('click', closeAdminModal);
+
+    if (adminLoginForm) {
+        adminLoginForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const key = adminKeyInput ? adminKeyInput.value.trim() : '';
+            if (!key) return;
+
+            const submitBtn = document.getElementById('admin-modal-submit');
+            if (submitBtn) submitBtn.disabled = true;
+
+            try {
+                const res = await safeFetchJson('/api/admin/verify', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': key
+                    },
+                    body: JSON.stringify({ admin_key: key })
+                });
+
+                if (res.success) {
+                    setAdminKey(key);
+                    closeAdminModal();
+                    showToast('✅ Administrator authorization verified. Staff Mode active.', 'success');
+                } else {
+                    if (adminModalError) {
+                        adminModalError.textContent = res.message || 'Invalid administrator key.';
+                        adminModalError.classList.remove('hidden');
+                    }
+                }
+            } catch (err) {
+                if (adminModalError) {
+                    adminModalError.textContent = err.message || 'Verification failed. Please check the admin key.';
+                    adminModalError.classList.remove('hidden');
+                }
+            } finally {
+                if (submitBtn) submitBtn.disabled = false;
+            }
+        });
+    }
+
+    // ---------------------------------------------------------
+    // Secure Item Deletion Handler
+    // ---------------------------------------------------------
+    async function handleDeleteItem(itemId, itemName, cardElement, deleteBtn) {
+        const adminKey = getAdminKey();
+        if (!adminKey) {
+            showToast('❌ Administrator credentials required to delete items.', 'error');
+            openAdminModal();
+            return;
+        }
+
+        const confirmMsg = `Are you sure you want to permanently delete "${itemName}" (Report #${itemId})?\n\nThis will remove the report, its AI vector embeddings, and related match records. This action cannot be undone.`;
+        if (!window.confirm(confirmMsg)) {
+            return;
+        }
+
+        deleteBtn.disabled = true;
+        const originalContent = deleteBtn.innerHTML;
+        deleteBtn.innerHTML = '⏳ Deleting...';
+
+        try {
+            const res = await safeFetchJson(`/api/items/${itemId}`, {
+                method: 'DELETE',
+                headers: {
+                    'X-Admin-Key': adminKey
+                }
+            });
+
+            showToast(`✅ ${res.message || 'Item deleted successfully.'}`, 'success');
+
+            // Smoothly remove card from displayed list without requiring full page reload
+            if (cardElement) {
+                cardElement.style.transition = 'opacity 0.25s ease, transform 0.25s ease';
+                cardElement.style.opacity = '0';
+                cardElement.style.transform = 'scale(0.95)';
+                setTimeout(() => {
+                    cardElement.remove();
+                }, 250);
+            }
+        } catch (err) {
+            console.error('Item deletion error:', err);
+            showToast(`❌ Deletion failed: ${err.message}`, 'error');
+            deleteBtn.disabled = false;
+            deleteBtn.innerHTML = originalContent;
+        }
+    }
+
+    // ---------------------------------------------------------
     // AI Natural Search Functions
     // ---------------------------------------------------------
-
     function updateClearButtonVisibility() {
         if (aiSearchInput.value.trim().length > 0) {
             aiClearBtn.classList.remove('hidden');
@@ -78,7 +330,7 @@ document.addEventListener('DOMContentLoaded', () => {
         aiSearchBtn.disabled = true;
 
         try {
-            const response = await fetch('/api/ai/search', {
+            const data = await safeFetchJson('/api/ai/search', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -89,12 +341,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     limit: 6
                 })
             });
-
-            const data = await response.json();
-
-            if (!response.ok) {
-                throw new Error(data.message || `Server responded with status ${response.status}`);
-            }
 
             // 1. Check OpenAI API Key status
             if (!data.api_key_configured) {
@@ -171,6 +417,21 @@ document.addEventListener('DOMContentLoaded', () => {
             <p><strong>Status:</strong> <span style="text-transform: capitalize; color: #15803d; font-weight: bold;">${escapeHtml(item.status || 'active')}</span></p>
             ${evidenceHtml}
         `;
+
+        // Admin-only Delete Button
+        if (isAdminLoggedIn() && item.id) {
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'delete-item-btn';
+            deleteBtn.type = 'button';
+            deleteBtn.innerHTML = '🗑️ Delete Report';
+            deleteBtn.title = `Delete item #${item.id}`;
+            deleteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                handleDeleteItem(item.id, item.item_name || 'Item', card, deleteBtn);
+            });
+            card.appendChild(deleteBtn);
+        }
+
         return card;
     }
 
@@ -201,14 +462,27 @@ document.addEventListener('DOMContentLoaded', () => {
     // ---------------------------------------------------------
     // Existing Items Browsing & Reporting
     // ---------------------------------------------------------
-
     async function fetchItems() {
+        const headers = {};
+        const adminKey = getAdminKey();
+        if (adminKey) {
+            headers['X-Admin-Key'] = adminKey;
+        }
+
         try {
-            const response = await fetch('/api/items');
-            const items = await response.json();
+            const items = await safeFetchJson('/api/items', { headers });
 
             lostItemsContainer.innerHTML = '';
             foundItemsContainer.innerHTML = '';
+
+            if (!Array.isArray(items) || items.length === 0) {
+                lostItemsContainer.innerHTML = '<div class="item-card"><p style="text-align: center; color: #64748b;">No active lost items reported yet.</p></div>';
+                foundItemsContainer.innerHTML = '<div class="item-card"><p style="text-align: center; color: #64748b;">No active found items reported yet.</p></div>';
+                return;
+            }
+
+            let lostCount = 0;
+            let foundCount = 0;
 
             items.forEach(item => {
                 const itemCard = document.createElement('div');
@@ -229,12 +503,35 @@ document.addEventListener('DOMContentLoaded', () => {
                     <p><em>📧 Email: ${escapeHtml(item.contact_email || 'Protected')}</em></p>
                 `;
 
+                // Admin-only Delete Button
+                if (isAdminLoggedIn() && item.id) {
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.className = 'delete-item-btn';
+                    deleteBtn.type = 'button';
+                    deleteBtn.innerHTML = '🗑️ Delete Report';
+                    deleteBtn.title = `Delete item #${item.id}`;
+                    deleteBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        handleDeleteItem(item.id, item.item_name || item.name || 'Item', itemCard, deleteBtn);
+                    });
+                    itemCard.appendChild(deleteBtn);
+                }
+
                 if (item.type === 'lost') {
                     lostItemsContainer.appendChild(itemCard);
+                    lostCount++;
                 } else {
                     foundItemsContainer.appendChild(itemCard);
+                    foundCount++;
                 }
             });
+
+            if (lostCount === 0) {
+                lostItemsContainer.innerHTML = '<div class="item-card"><p style="text-align: center; color: #64748b;">No active lost items reported yet.</p></div>';
+            }
+            if (foundCount === 0) {
+                foundItemsContainer.innerHTML = '<div class="item-card"><p style="text-align: center; color: #64748b;">No active found items reported yet.</p></div>';
+            }
         } catch (error) {
             console.error('Error fetching items:', error);
             lostItemsContainer.innerHTML = '<div class="item-card"><p style="text-align: center; color: #dc3545;">❌ Could not load lost items. Please try again later.</p></div>';
@@ -249,8 +546,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const formData = new FormData(itemReportForm);
         const itemData = Object.fromEntries(formData.entries());
 
+        const submitBtn = itemReportForm.querySelector('button[type="submit"]');
+        if (submitBtn) submitBtn.disabled = true;
+
         try {
-            const response = await fetch('/api/items', {
+            const result = await safeFetchJson('/api/items', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -258,24 +558,22 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify(itemData)
             });
 
-            const result = await response.json();
-
-            if (response.ok) {
-                formMessage.textContent = '✅ Item reported successfully! Your report has been saved and indexed for AI search.';
-                formMessage.style.color = 'green';
-                itemReportForm.reset();
-                fetchItems();
-            } else {
-                formMessage.textContent = `❌ Error: ${result.message || 'Something went wrong. Please try again.'}`;
-                formMessage.style.color = 'red';
-            }
+            formMessage.textContent = '✅ Item reported successfully! Your report has been saved and indexed for AI search.';
+            formMessage.style.color = 'green';
+            itemReportForm.reset();
+            fetchItems();
+            showToast('✅ Report submitted successfully!', 'success');
         } catch (error) {
             console.error('Error submitting report:', error);
-            formMessage.textContent = '🌐 Network error. Please check your connection and try again.';
+            formMessage.textContent = `❌ Error: ${error.message || 'Something went wrong. Please try again.'}`;
             formMessage.style.color = 'red';
+            showToast(`❌ Report error: ${error.message}`, 'error');
+        } finally {
+            if (submitBtn) submitBtn.disabled = false;
         }
     });
 
-    // Initial fetch of items when the page loads
+    // Initialize UI
+    updateAdminUIState();
     fetchItems();
 });

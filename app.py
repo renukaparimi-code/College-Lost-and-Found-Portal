@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import hmac
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 
@@ -15,6 +16,14 @@ matcher = HybridAIMatcher()
 
 def get_db():
     return database.get_db_connection()
+
+def is_admin_request() -> bool:
+    """Validates X-Admin-Key header using constant-time comparison."""
+    header_key = request.headers.get('X-Admin-Key', '')
+    expected_key = getattr(config, 'ADMIN_KEY', '')
+    if not header_key or not expected_key:
+        return False
+    return hmac.compare_digest(header_key.strip(), expected_key.strip())
 
 # Initialize database and vector store on startup
 with app.app_context():
@@ -87,8 +96,10 @@ def ai_search():
             'results': results
         }), 200
     except Exception as e:
+        print(f"Notice: AI search notice: {type(e).__name__}")
         return jsonify({
-            'message': f'Search error occurred: {str(e)}',
+            'success': False,
+            'message': 'An error occurred while processing the search request.',
             'results': []
         }), 500
     finally:
@@ -104,7 +115,7 @@ def get_items():
     Privacy safeguard: Redacts sensitive student phone, email, and registration number
     from public feeds unless authorized campus staff provides X-Admin-Key.
     """
-    is_admin = request.headers.get('X-Admin-Key') == config.ADMIN_KEY
+    is_admin = is_admin_request()
     item_type = request.args.get('type')
     status_filter = request.args.get('status')
 
@@ -262,9 +273,8 @@ def add_item():
 @app.route('/api/items/<int:item_id>/status', methods=['PATCH'])
 def update_item_status(item_id):
     """Updates item status (active/resolved). Requires campus staff authorization."""
-    admin_key = request.headers.get('X-Admin-Key')
-    if admin_key != config.ADMIN_KEY:
-        return jsonify({'message': 'Unauthorized: Valid X-Admin-Key required'}), 403
+    if not is_admin_request():
+        return jsonify({'success': False, 'message': 'Unauthorized: Valid X-Admin-Key required'}), 403
 
     data = request.get_json(silent=True) or {}
     new_status = data.get('status')
@@ -298,6 +308,83 @@ def update_item_status(item_id):
             pass
 
     return jsonify({'message': 'Item status updated successfully', 'status': new_status}), 200
+
+# -------------------------------------------------------------
+# Admin Deletion Endpoint
+# -------------------------------------------------------------
+@app.route('/api/items/<item_id>', methods=['DELETE'])
+def delete_item(item_id):
+    """
+    Deletes a lost or found item report.
+    Security: Strictly restricted to authorized campus staff with valid X-Admin-Key.
+    Cleans up related matches, claims, and vector store embeddings safely.
+    """
+    if not is_admin_request():
+        return jsonify({
+            'success': False,
+            'message': 'Unauthorized: Valid X-Admin-Key required to delete items'
+        }), 403
+
+    try:
+        numeric_id = int(item_id)
+        if numeric_id <= 0:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify({
+            'success': False,
+            'message': 'Invalid item ID. Must be a positive integer.'
+        }), 400
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id, item_name, type FROM items WHERE id = ?", (numeric_id,))
+        item_row = cursor.fetchone()
+        if not item_row:
+            return jsonify({
+                'success': False,
+                'message': f'Item #{numeric_id} not found'
+            }), 404
+
+        item_name = item_row['item_name']
+
+        # Clean up referencing records in matches and claims
+        cursor.execute("DELETE FROM matches WHERE lost_item_id = ? OR found_item_id = ?", (numeric_id, numeric_id))
+        cursor.execute("DELETE FROM claims WHERE item_id = ?", (numeric_id,))
+        cursor.execute("DELETE FROM items WHERE id = ?", (numeric_id,))
+        conn.commit()
+
+        # Clean up vector database entry
+        try:
+            rag_service_instance.delete_item(numeric_id)
+        except Exception as e:
+            print(f"Notice: Vector store deletion cleanup notice: {type(e).__name__}")
+
+        return jsonify({
+            'success': True,
+            'message': f"Item '{item_name}' (ID #{numeric_id}) deleted successfully"
+        }), 200
+    except sqlite3.Error as e:
+        conn.rollback()
+        return jsonify({
+            'success': False,
+            'message': 'Database error occurred during deletion.'
+        }), 500
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------
+# Admin Verification Endpoint
+# -------------------------------------------------------------
+@app.route('/api/admin/verify', methods=['POST'])
+def verify_admin():
+    """Validates admin authorization key without exposing secrets."""
+    data = request.get_json(silent=True) or {}
+    key = request.headers.get('X-Admin-Key') or data.get('admin_key', '')
+    expected_key = getattr(config, 'ADMIN_KEY', '')
+    if key and expected_key and hmac.compare_digest(str(key).strip(), str(expected_key).strip()):
+        return jsonify({'success': True, 'message': 'Admin authorization verified'}), 200
+    return jsonify({'success': False, 'message': 'Invalid admin authorization key'}), 401
 
 # -------------------------------------------------------------
 # Automated Matches Endpoints
@@ -387,9 +474,8 @@ def submit_claim():
 @app.route('/api/claims', methods=['GET'])
 def get_claims():
     """Inspects pending claims. Requires campus staff authorization."""
-    admin_key = request.headers.get('X-Admin-Key')
-    if admin_key != config.ADMIN_KEY:
-        return jsonify({'message': 'Unauthorized: Valid X-Admin-Key required'}), 403
+    if not is_admin_request():
+        return jsonify({'success': False, 'message': 'Unauthorized: Valid X-Admin-Key required'}), 403
 
     conn = get_db()
     rows = conn.execute('SELECT * FROM claims ORDER BY created_at DESC').fetchall()
@@ -429,6 +515,30 @@ def get_stats():
         'resolved_reports': resolved_reports,
         'potential_matches': potential_matches
     })
+
+# -------------------------------------------------------------
+# Global JSON Error Handlers (Prevents Raw HTML Error Responses)
+# -------------------------------------------------------------
+@app.errorhandler(400)
+def handle_400(err):
+    return jsonify({'success': False, 'message': getattr(err, 'description', 'Bad Request')}), 400
+
+@app.errorhandler(404)
+def handle_404(err):
+    return jsonify({'success': False, 'message': 'Resource not found'}), 404
+
+@app.errorhandler(405)
+def handle_405(err):
+    return jsonify({'success': False, 'message': 'Method not allowed'}), 405
+
+@app.errorhandler(500)
+def handle_500(err):
+    return jsonify({'success': False, 'message': 'Internal server error'}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(err):
+    print(f"Notice: Unhandled server exception: {type(err).__name__}")
+    return jsonify({'success': False, 'message': 'An unexpected server error occurred.'}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))

@@ -200,21 +200,53 @@ Run the full pytest suite (21 automated unit and integration tests):
 * `tests/test_privacy.py` (2 tests):
   * Student contact redaction on public endpoints.
   * Accurate dashboard database counts.
+* `tests/test_admin_deletion_and_ai_errors.py` (18 tests):
+  * Admin key verification (`POST /api/admin/verify`).
+  * Rejection of unauthenticated visitors attempting deletion (`403 Forbidden`).
+  * Prevention of student authorization bypasses (e.g. `isAdmin=true` spoofing).
+  * Authorized item deletion and cascading cleanup of matches, claims, and ChromaDB vector embeddings.
+  * 404 responses for nonexistent item deletions and 400 for invalid/negative IDs.
+  * Verification that deleting an item does not affect unrelated records.
+  * Mocked OpenAI success, timeout (`APITimeoutError`), rate limit (`RateLimitError`), and authentication error handling.
+  * Safe 500 error handling returning predictable JSON for server exceptions.
+
+Total: **39 automated tests** covering security, API reliability, RAG retrieval, and AI matching.
 
 ---
 
 ## 📡 REST API Reference
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/ai/search` | **RAG Natural Language Search**: Vector search + OpenAI LLM synthesis |
-| `GET` | `/api/items` | List reported items (publicly redacted; `X-Admin-Key` reveals contacts) |
-| `POST` | `/api/items` | Report lost/found item; syncs with vector store & generates candidate matches |
-| `PATCH` | `/api/items/<id>/status` | Update item status (`active`, `resolved`). Protected by `X-Admin-Key` |
-| `GET` | `/api/matches` | Retrieve candidate matches between lost and found items |
-| `POST` | `/api/claims` | Submit ownership verification claim with identifying marks |
-| `GET` | `/api/claims` | Inspect submitted claims (Protected by `X-Admin-Key`) |
-| `GET` | `/api/dashboard/stats` | Real-time counts of lost, found, active, and resolved items |
+| Method | Endpoint | Authorization | Description |
+|---|---|---|---|
+| `POST` | `/api/ai/search` | Public | **RAG Natural Language Search**: Vector search + OpenAI LLM synthesis |
+| `GET` | `/api/items` | Public / Admin | List reported items (publicly redacted; `X-Admin-Key` reveals contacts) |
+| `POST` | `/api/items` | Public | Report lost/found item; syncs with vector store & generates candidate matches |
+| `DELETE` | `/api/items/<item_id>` | **Admin Only** | Deletes an item, cascades to matches & claims, and cleans up ChromaDB embeddings |
+| `POST` | `/api/admin/verify` | Public (Key check) | Verifies administrator credentials using constant-time comparison |
+| `PATCH` | `/api/items/<id>/status` | **Admin Only** | Update item status (`active`, `resolved`). Protected by `X-Admin-Key` |
+| `GET` | `/api/matches` | Public | Retrieve candidate matches between lost and found items |
+| `POST` | `/api/claims` | Public | Submit ownership verification claim with identifying marks |
+| `GET` | `/api/claims` | **Admin Only** | Inspect submitted claims (Protected by `X-Admin-Key`) |
+| `GET` | `/api/dashboard/stats` | Public | Real-time counts of lost, found, active, and resolved items |
+
+---
+
+## 🛡️ Admin Authorization & Item Deletion
+
+1. **Staff Mode Access**: Campus administrators click the **Staff Login** button in the header and input their secret `ADMIN_KEY`.
+2. **Server-Side Enforcement**: All state-changing admin actions (`DELETE /api/items/<id>`, `PATCH /api/items/<id>/status`, `GET /api/claims`) strictly enforce the `X-Admin-Key` header with constant-time `hmac.compare_digest` to prevent timing attacks.
+3. **No Frontend Secrets**: The admin secret is never embedded in JavaScript or HTML.
+4. **Relational & Vector Integrity**: Deleting an item removes the database record, referencing rows in `matches` and `claims`, and removes the item's embedding from ChromaDB.
+
+---
+
+## 🚀 Deployment on Render
+
+The repository is pre-configured for deployment on Render:
+* **Start Command**: `gunicorn app:app`
+* **Port Binding**: Automatically reads the dynamic `$PORT` environment variable provided by Render.
+* **Requirements**: Dependencies are frozen in `requirements.txt` (including `gunicorn`, `flask`, `chromadb`, and `openai`).
+* **Environment Variables**: Configure `OPENAI_API_KEY`, `ADMIN_KEY`, and `FLASK_DEBUG=0` in Render's Environment Settings dashboard.
 
 ---
 
@@ -224,3 +256,4 @@ Run the full pytest suite (21 automated unit and integration tests):
 2. **Student Privacy**: Phone numbers, emails, and student registration IDs are excluded from vector embeddings and redacted from public API outputs.
 3. **Anti-Prompt-Injection**: User queries and item descriptions are treated strictly as untrusted text within system prompts.
 4. **No Premature Handover**: High match percentages are explicitly labeled as *potential matches*, directing students to submit verification claims for administrative approval.
+

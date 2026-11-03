@@ -1,7 +1,9 @@
 import os
 import re
+import numpy as np
 import chromadb
 from chromadb.config import Settings
+from sklearn.feature_extraction.text import HashingVectorizer
 import config
 from ai_matcher import HybridAIMatcher, normalize_text, expand_synonyms
 
@@ -17,7 +19,20 @@ class RAGService:
         self.collection_name = collection_name or config.CHROMA_COLLECTION
         self.in_memory = in_memory
         self.matcher = HybridAIMatcher()
+        self.vectorizer = HashingVectorizer(n_features=384, norm='l2', alternate_sign=False)
         self._init_chroma()
+
+    def embed_text(self, text: str) -> list:
+        """Generates a fast normalized 384-dimensional semantic embedding with domain expansion."""
+        expanded = expand_synonyms(text or "")
+        matrix = self.vectorizer.transform([expanded]).toarray().astype(np.float32)
+        return matrix[0].tolist()
+
+    def embed_batch(self, texts: list) -> list:
+        """Generates embeddings for a batch of text documents."""
+        expanded = [expand_synonyms(t or "") for t in texts]
+        matrix = self.vectorizer.transform(expanded).toarray().astype(np.float32)
+        return matrix.tolist()
 
     def _init_chroma(self):
         """Initializes ChromaDB client and collection."""
@@ -84,21 +99,26 @@ class RAGService:
         if not item or "id" not in item:
             return
 
-        item_id = str(item["id"])
-        doc = self.build_item_document(item)
-        metadata = {
-            "id": int(item["id"]),
-            "type": str(item.get("type", "lost")).lower(),
-            "status": str(item.get("status", "active")).lower(),
-            "category": str(item.get("category") or "Other"),
-            "location": str(item.get("location") or "")
-        }
+        try:
+            item_id = str(item["id"])
+            doc = self.build_item_document(item)
+            metadata = {
+                "id": int(item["id"]),
+                "type": str(item.get("type", "lost")).lower(),
+                "status": str(item.get("status", "active")).lower(),
+                "category": str(item.get("category") or "Other"),
+                "location": str(item.get("location") or "")
+            }
+            emb = self.embed_text(doc)
 
-        self.collection.upsert(
-            ids=[item_id],
-            documents=[doc],
-            metadatas=[metadata]
-        )
+            self.collection.upsert(
+                ids=[item_id],
+                documents=[doc],
+                metadatas=[metadata],
+                embeddings=[emb]
+            )
+        except Exception as e:
+            print(f"Notice: Vector store sync deferred: {e}")
 
     def delete_item(self, item_id: int):
         """Removes an item from the vector store."""
@@ -109,37 +129,43 @@ class RAGService:
 
     def sync_all_from_db(self, db_conn):
         """Synchronizes all active records from SQLite into ChromaDB."""
-        cursor = db_conn.cursor()
-        cursor.execute("SELECT * FROM items")
-        rows = cursor.fetchall()
+        try:
+            cursor = db_conn.cursor()
+            cursor.execute("SELECT * FROM items")
+            rows = cursor.fetchall()
 
-        if not rows:
+            if not rows:
+                return 0
+
+            ids = []
+            docs = []
+            metadatas = []
+
+            for row in rows:
+                item = dict(row)
+                item_id = str(item["id"])
+                ids.append(item_id)
+                docs.append(self.build_item_document(item))
+                metadatas.append({
+                    "id": int(item["id"]),
+                    "type": str(item.get("type", "lost")).lower(),
+                    "status": str(item.get("status", "active")).lower(),
+                    "category": str(item.get("category") or "Other"),
+                    "location": str(item.get("location") or "")
+                })
+
+            if ids:
+                embs = self.embed_batch(docs)
+                self.collection.upsert(
+                    ids=ids,
+                    documents=docs,
+                    metadatas=metadatas,
+                    embeddings=embs
+                )
+            return len(ids)
+        except Exception as e:
+            print(f"Notice: Vector store batch sync deferred: {e}")
             return 0
-
-        ids = []
-        docs = []
-        metadatas = []
-
-        for row in rows:
-            item = dict(row)
-            item_id = str(item["id"])
-            ids.append(item_id)
-            docs.append(self.build_item_document(item))
-            metadatas.append({
-                "id": int(item["id"]),
-                "type": str(item.get("type", "lost")).lower(),
-                "status": str(item.get("status", "active")).lower(),
-                "category": str(item.get("category") or "Other"),
-                "location": str(item.get("location") or "")
-            })
-
-        if ids:
-            self.collection.upsert(
-                ids=ids,
-                documents=docs,
-                metadatas=metadatas
-            )
-        return len(ids)
 
     def parse_intent(self, query: str) -> str:
         """
@@ -171,6 +197,64 @@ class RAGService:
 
         return "all"
 
+    def _fallback_sqlite_search(self, query: str, target_type: str, top_k: int, db_conn) -> list:
+        """
+        Fallback search executing hybrid semantic matching directly against SQLite database records.
+        Guarantees student search never breaks if vector database is unavailable or degraded.
+        """
+        if not db_conn:
+            return []
+        try:
+            cursor = db_conn.cursor()
+            if target_type:
+                cursor.execute("SELECT * FROM items WHERE status = 'active' AND type = ?", (target_type,))
+                rows = cursor.fetchall()
+            else:
+                rows = []
+
+            if not rows:
+                cursor.execute("SELECT * FROM items WHERE status = 'active'")
+                rows = cursor.fetchall()
+
+            if not rows:
+                return []
+
+            query_item = {
+                'item_name': query,
+                'description': query,
+                'location': query
+            }
+
+            ranked = []
+            for row in rows:
+                item = dict(row)
+                score_data = self.matcher.score_pair(query_item, item)
+                score = score_data['similarity_score']
+                if score >= config.SIMILARITY_THRESHOLD:
+                    ranked.append({
+                        "id": item["id"],
+                        "type": item["type"],
+                        "item_name": item["item_name"],
+                        "category": item.get("category") or "Other",
+                        "description": item.get("description") or "",
+                        "color": item.get("color") or "",
+                        "brand": item.get("brand") or "",
+                        "distinctive_features": item.get("distinctive_features") or "",
+                        "location": item.get("location") or "Not specified",
+                        "item_date": item.get("item_date") or (item.get("reported_at", "")[:10] if item.get("reported_at") else "Not specified"),
+                        "status": item.get("status") or "active",
+                        "reported_at": item.get("reported_at", ""),
+                        "similarity_score": score,
+                        "confidence": score_data.get('confidence', 'Possible match'),
+                        "evidence": score_data.get('evidence', [])
+                    })
+
+            ranked.sort(key=lambda x: x["similarity_score"], reverse=True)
+            return ranked[:top_k]
+        except Exception as e:
+            print(f"Notice: SQLite fallback search error: {e}")
+            return []
+
     def search(self, query: str, scope: str = "all", top_k: int = 5, db_conn = None) -> list:
         """
         Executes semantic vector search against ChromaDB and verifies against SQLite database.
@@ -181,13 +265,6 @@ class RAGService:
 
         cleaned_query = query.strip()
 
-        # If ChromaDB is empty and DB connection is provided, auto-sync
-        if self.collection.count() == 0 and db_conn:
-            self.sync_all_from_db(db_conn)
-
-        if self.collection.count() == 0:
-            return []
-
         # Determine target item type
         target_type = None
         if scope in ("lost", "found"):
@@ -197,66 +274,85 @@ class RAGService:
             if inferred in ("lost", "found"):
                 target_type = inferred
 
-        # Build ChromaDB where filter
-        where_filter = {"status": "active"}
-        if target_type:
-            where_filter = {
-                "$and": [
-                    {"status": "active"},
-                    {"type": target_type}
-                ]
-            }
-
-        n_results = min(top_k * 3, max(1, self.collection.count()))
+        # Attempt vector search via ChromaDB
         results = None
-        if target_type and scope != "all":
-            # Strict scope requested by user
-            try:
-                results = self.collection.query(
-                    query_texts=[cleaned_query],
-                    n_results=n_results,
-                    where=where_filter
-                )
-            except Exception:
-                results = None
-        elif target_type and scope == "all":
-            # Inferred target type: try target type first, fallback to all active items if none found
-            try:
-                results = self.collection.query(
-                    query_texts=[cleaned_query],
-                    n_results=n_results,
-                    where=where_filter
-                )
-            except Exception:
-                results = None
+        try:
+            # If ChromaDB is empty and DB connection is provided, auto-sync
+            if self.collection.count() == 0 and db_conn:
+                self.sync_all_from_db(db_conn)
 
-            if not results or not results.get("ids") or not results["ids"][0]:
-                try:
-                    results = self.collection.query(
-                        query_texts=[cleaned_query],
-                        n_results=n_results,
-                        where={"status": "active"}
-                    )
-                except Exception:
-                    results = None
-        else:
-            try:
-                results = self.collection.query(
-                    query_texts=[cleaned_query],
-                    n_results=n_results,
-                    where={"status": "active"}
-                )
-            except Exception:
-                results = None
+            col_count = self.collection.count()
+            if col_count > 0:
+                q_emb = self.embed_text(cleaned_query)
+                where_filter = {"status": "active"}
+                if target_type:
+                    where_filter = {
+                        "$and": [
+                            {"status": "active"},
+                            {"type": target_type}
+                        ]
+                    }
+
+                n_results = min(top_k * 3, max(1, col_count))
+
+                if target_type and scope != "all":
+                    try:
+                        results = self.collection.query(
+                            query_texts=[cleaned_query],
+                            query_embeddings=[q_emb],
+                            n_results=n_results,
+                            where=where_filter
+                        )
+                    except Exception:
+                        results = None
+                elif target_type and scope == "all":
+                    try:
+                        results = self.collection.query(
+                            query_texts=[cleaned_query],
+                            query_embeddings=[q_emb],
+                            n_results=n_results,
+                            where=where_filter
+                        )
+                    except Exception:
+                        results = None
+
+                    if not results or not results.get("ids") or not results["ids"][0]:
+                        try:
+                            results = self.collection.query(
+                                query_texts=[cleaned_query],
+                                query_embeddings=[q_emb],
+                                n_results=n_results,
+                                where={"status": "active"}
+                            )
+                        except Exception:
+                            results = None
+                else:
+                    try:
+                        results = self.collection.query(
+                            query_texts=[cleaned_query],
+                            query_embeddings=[q_emb],
+                            n_results=n_results,
+                            where={"status": "active"}
+                        )
+                    except Exception:
+                        results = None
+
+                if not results or not results.get("ids") or not results["ids"][0]:
+                    try:
+                        results = self.collection.query(
+                            query_texts=[cleaned_query],
+                            query_embeddings=[q_emb],
+                            n_results=n_results
+                        )
+                    except Exception:
+                        results = None
+        except Exception as e:
+            print(f"Notice: ChromaDB search failed, activating SQLite fallback: {e}")
+            results = None
 
         if not results or not results.get("ids") or not results["ids"][0]:
-            try:
-                results = self.collection.query(
-                    query_texts=[cleaned_query],
-                    n_results=n_results
-                )
-            except Exception:
-                return []
+            # Graceful fallback to SQLite hybrid matching
+            return self._fallback_sqlite_search(cleaned_query, target_type, top_k, db_conn)
 
         retrieved_ids = []
         retrieved_distances = {}
@@ -269,13 +365,16 @@ class RAGService:
                 retrieved_distances[item_id] = similarity
 
         if not retrieved_ids or not db_conn:
-            return []
+            return self._fallback_sqlite_search(cleaned_query, target_type, top_k, db_conn)
 
         # Retrieve authoritative SQLite database records
         cursor = db_conn.cursor()
         placeholders = ",".join("?" for _ in retrieved_ids)
         cursor.execute(f"SELECT * FROM items WHERE id IN ({placeholders}) AND status = 'active'", retrieved_ids)
         db_items = [dict(row) for row in cursor.fetchall()]
+
+        if not db_items:
+            return self._fallback_sqlite_search(cleaned_query, target_type, top_k, db_conn)
 
         ranked_results = []
         for item in db_items:

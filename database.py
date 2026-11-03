@@ -1,11 +1,16 @@
 import sqlite3
 import os
 from datetime import datetime
-from config import DATABASE
+import config
+
+DATABASE = config.DATABASE
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE)
+    # Resolves dynamically to allow test monkeypatching of database.DATABASE or config.DATABASE
+    db_path = globals().get('DATABASE') or getattr(config, 'DATABASE', 'lost_found.db')
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 def init_db():

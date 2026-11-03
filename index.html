@@ -16,9 +16,15 @@
                 <li><a href="#lost-items">📱 Lost Items</a></li>
                 <li><a href="#found-items">🔍 Found Items</a></li>
                 <li><a href="#report-item">📝 Report Item</a></li>
+                <li><button id="admin-auth-btn" class="admin-nav-btn" type="button">🔐 Staff Login</button></li>
             </ul>
         </nav>
     </header>
+
+    <div id="admin-banner" class="admin-banner hidden">
+        <span>🛡️ <strong>Staff Admin Mode Active</strong> — Authorized to delete item reports and inspect claims.</span>
+        <button id="admin-logout-btn" class="admin-logout-btn" type="button">Logout</button>
+    </div>
 
     <main>
         <!-- AI-Powered Natural Language RAG Search Section -->
@@ -232,6 +238,31 @@
     <footer>
         <p>&copy; 2026 College Lost & Found Portal | Powered by Semantic RAG & Generative AI</p>
     </footer>
+
+    <!-- Admin Login Modal -->
+    <div id="admin-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="admin-modal-title">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3 id="admin-modal-title">🔐 Campus Staff Authorization</h3>
+                <button id="admin-modal-close" class="modal-close-btn" type="button" aria-label="Close modal">&times;</button>
+            </div>
+            <p class="modal-sub">Enter the authorized campus administrator key to manage reports and enable deletion privileges.</p>
+            <form id="admin-login-form">
+                <div class="modal-form-group">
+                    <label for="admin-key-input">Admin Authorization Key:</label>
+                    <input type="password" id="admin-key-input" placeholder="Enter campus admin key" autocomplete="off" required>
+                </div>
+                <div id="admin-modal-error" class="modal-error hidden"></div>
+                <div class="modal-actions">
+                    <button type="button" id="admin-modal-cancel" class="cancel-btn">Cancel</button>
+                    <button type="submit" id="admin-modal-submit" class="submit-btn modal-submit">Verify & Login</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Toast Notification Container -->
+    <div id="portal-toast" class="portal-toast hidden" role="alert" aria-live="polite"></div>
 
     <script src="script.js"></script>
 </body>
