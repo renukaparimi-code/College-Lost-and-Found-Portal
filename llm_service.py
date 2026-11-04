@@ -28,8 +28,19 @@ class OpenAIRAGService:
 
     def is_api_key_configured(self) -> bool:
         """Checks if a valid OpenAI API key is configured."""
-        key = (self.api_key or "").strip()
-        return bool(key and key != "your_openai_api_key_here" and _OPENAI_AVAILABLE)
+        provider = (getattr(self, "llm_provider", "openai") or "openai").lower().strip()
+        if provider == "none":
+            return False
+        key = (getattr(self, "api_key", "") or "").strip()
+        invalid_placeholders = {
+            "your_openai_api_key_here",
+            "your_api_key_here",
+            "sk-placeholder",
+            "sk-proj-placeholder",
+            "none",
+            "dummy"
+        }
+        return bool(key and key.lower() not in invalid_placeholders and _OPENAI_AVAILABLE)
 
     def _get_openai_client(self):
         if not self.is_api_key_configured():
@@ -82,7 +93,7 @@ class OpenAIRAGService:
                 f"Category: {item.get('category')} | Location: {item.get('location')} | "
                 f"Date: {item.get('item_date')} | Status: {item.get('status')} | "
                 f"Description: {item.get('description')} | Match Confidence: {item.get('confidence')} "
-                f"({int(item.get('similarity_score', 0) * 100)}%)"
+                f"({int(float(item.get('similarity_score') or 0) * 100)}%)"
             )
             context_lines.append(line)
 
@@ -199,7 +210,7 @@ class OpenAIRAGService:
                         f"- Location: {found_item.get('location') or 'Not specified'}\n"
                         f"- Color: {found_item.get('color') or 'Not specified'}\n"
                         f"- Brand: {found_item.get('brand') or 'Not specified'}\n\n"
-                        f"Match Score: {int(score_data.get('similarity_score', 0) * 100)}%"
+                        f"Match Score: {int(float(score_data.get('similarity_score') or 0) * 100)}%"
                     )
                     res = client.chat.completions.create(
                         model=self.model,

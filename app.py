@@ -27,7 +27,10 @@ def is_admin_request() -> bool:
 
 # Initialize database and vector store on startup
 with app.app_context():
-    database.init_db()
+    try:
+        database.init_db()
+    except Exception as e:
+        print(f"Warning: Database initialization deferred: {e}")
     try:
         conn = get_db()
         rag_service_instance.sync_all_from_db(conn)

@@ -17,7 +17,12 @@ htmlcov/
 # Vector Database & Data Cache
 chroma_data/
 test_chroma*/
+data/
+test_data*/
 *.db
+*.sqlite
+*.sqlite3
+*.log
 
 # Editor / OS
 .vscode/

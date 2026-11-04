@@ -209,8 +209,18 @@ Run the full pytest suite (21 automated unit and integration tests):
   * Verification that deleting an item does not affect unrelated records.
   * Mocked OpenAI success, timeout (`APITimeoutError`), rate limit (`RateLimitError`), and authentication error handling.
   * Safe 500 error handling returning predictable JSON for server exceptions.
+* `tests/test_storage_and_render_config.py` (9 tests):
+  * `DATA_DIR` persistent disk resolution for SQLite and ChromaDB (`/var/data`).
+  * Explicit `DATABASE_PATH` and `CHROMA_PATH` environment overrides.
+  * Resilient `RAGService` startup and graceful fallback on read-only filesystems.
+  * Preventing ChromaDB from downloading ONNX models (`embedding_function=None`).
+  * Safe item creation (HTTP 201) when vector store synchronization fails.
+  * Seamless fallback to SQLite hybrid search when vector search encounters errors.
+  * Graceful handling when `LLM_PROVIDER="none"`.
+  * Production dependency verification (`gunicorn` in `requirements.txt`).
+  * Prevention of exposed secrets in `.env.example`.
 
-Total: **39 automated tests** covering security, API reliability, RAG retrieval, and AI matching.
+Total: **48 automated tests** covering security, API reliability, RAG retrieval, storage configuration, and AI matching.
 
 ---
 
@@ -242,11 +252,51 @@ Total: **39 automated tests** covering security, API reliability, RAG retrieval,
 
 ## 🚀 Deployment on Render
 
-The repository is pre-configured for deployment on Render:
-* **Start Command**: `gunicorn app:app`
-* **Port Binding**: Automatically reads the dynamic `$PORT` environment variable provided by Render.
-* **Requirements**: Dependencies are frozen in `requirements.txt` (including `gunicorn`, `flask`, `chromadb`, and `openai`).
-* **Environment Variables**: Configure `OPENAI_API_KEY`, `ADMIN_KEY`, and `FLASK_DEBUG=0` in Render's Environment Settings dashboard.
+The repository is fully configured for deployment as a **Web Service** on [Render](https://render.com):
+
+### 1. Web Service Settings
+* **Environment**: `Python 3`
+* **Build Command**: `pip install -r requirements.txt`
+* **Start Command**:
+  ```bash
+  gunicorn --workers 2 --timeout 120 --bind 0.0.0.0:$PORT app:app
+  ```
+  *(The `--timeout 120` prevents Gunicorn worker timeouts during cold starts and LLM completions).*
+
+### 2. Render Persistent Disk (Data Persistence)
+On cloud platforms like Render, application container instances have ephemeral storage by default (data resets on every new deploy or service restart). To permanently retain reported items and vector embeddings:
+
+1. In the Render Dashboard, open your Web Service and navigate to **Disks**.
+2. Click **Add a Disk**.
+3. Set the following disk parameters:
+   * **Name**: `portal-data`
+   * **Mount Path**: `/var/data`
+   * **Size**: `1 GB` (or as required)
+4. Go to **Environment** settings and add the environment variable:
+   * **`DATA_DIR`**: `/var/data`
+
+When `DATA_DIR=/var/data` is configured, the application automatically places:
+* **SQLite Database**: `/var/data/lost_found.db`
+* **ChromaDB Vector Store**: `/var/data/chroma_data`
+
+*(Note: If no persistent disk is mounted, the portal still operates reliably using ephemeral local storage in the service directory).*
+
+### 3. Environment Variables (Render Dashboard)
+Configure the following in your service's **Environment** tab:
+
+| Variable | Recommended Production Value | Description |
+|---|---|---|
+| `DATA_DIR` | `/var/data` | Mount point for Render Persistent Disk |
+| `OPENAI_API_KEY` | `sk-...` | Your OpenAI API key (kept confidential) |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Recommended OpenAI model |
+| `OPENAI_TIMEOUT` | `10` | Timeout in seconds for OpenAI calls |
+| `LLM_PROVIDER` | `openai` | LLM provider (`openai`, `gemini`, or `none`) |
+| `ADMIN_KEY` | `your_secret_admin_password` | Authorization key for Staff Mode |
+| `CHROMA_TELEMETRY` | `0` | Disables outbound telemetry to eliminate SSL timeouts |
+| `FLASK_DEBUG` | `0` | Production mode (disabled debug) |
+
+### 4. Zero External Embedding Downloads
+ChromaDB is initialized with `embedding_function=None` and telemetry disabled, utilizing the built-in 384-dimensional domain vectorizer. It requires **zero external model downloads** (no 80MB ONNX downloads at runtime), eliminating container timeouts and SSL handshake issues.
 
 ---
 

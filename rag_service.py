@@ -35,17 +35,32 @@ class RAGService:
         return matrix.tolist()
 
     def _init_chroma(self):
-        """Initializes ChromaDB client and collection."""
+        """Initializes ChromaDB client and collection with safe error handling."""
+        settings = Settings(anonymized_telemetry=False)
         if self.in_memory or self.chroma_path == ":memory:":
-            self.client = chromadb.EphemeralClient()
+            self.client = chromadb.EphemeralClient(settings=settings)
         else:
-            os.makedirs(self.chroma_path, exist_ok=True)
-            self.client = chromadb.PersistentClient(path=self.chroma_path)
-            
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
+            try:
+                os.makedirs(self.chroma_path, exist_ok=True)
+                persistent_settings = Settings(anonymized_telemetry=False, is_persistent=True)
+                self.client = chromadb.PersistentClient(path=self.chroma_path, settings=persistent_settings)
+            except OSError as e:
+                # E.g. Errno 30 Read-only file system or permission error
+                print(f"Warning: Chroma storage path '{self.chroma_path}' not writable ({e}). Using in-memory client.")
+                self.in_memory = True
+                self.client = chromadb.EphemeralClient(settings=settings)
+
+        try:
+            # Explicitly pass embedding_function=None to prevent ChromaDB from attempting
+            # to download the ~80MB ONNX all-MiniLM-L6-v2 model over the network.
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=None
+            )
+        except Exception as e:
+            print(f"Warning: Chroma collection initialization error: {e}")
+            self.collection = None
 
     def build_item_document(self, item: dict) -> str:
         """
@@ -96,7 +111,7 @@ class RAGService:
 
     def sync_item(self, item: dict):
         """Adds or updates a single item in the ChromaDB vector collection."""
-        if not item or "id" not in item:
+        if not item or "id" not in item or self.collection is None:
             return
 
         try:
@@ -122,6 +137,8 @@ class RAGService:
 
     def delete_item(self, item_id: int):
         """Removes an item from the vector store."""
+        if self.collection is None:
+            return
         try:
             self.collection.delete(ids=[str(item_id)])
         except Exception:
@@ -129,6 +146,8 @@ class RAGService:
 
     def sync_all_from_db(self, db_conn):
         """Synchronizes all active records from SQLite into ChromaDB."""
+        if self.collection is None or db_conn is None:
+            return 0
         try:
             cursor = db_conn.cursor()
             cursor.execute("SELECT * FROM items")
@@ -274,6 +293,10 @@ class RAGService:
             if inferred in ("lost", "found"):
                 target_type = inferred
 
+        # If ChromaDB collection is not available, immediately use robust SQLite hybrid search
+        if self.collection is None:
+            return self._fallback_sqlite_search(cleaned_query, target_type, top_k, db_conn)
+
         # Attempt vector search via ChromaDB
         results = None
         try:
@@ -298,7 +321,6 @@ class RAGService:
                 if target_type and scope != "all":
                     try:
                         results = self.collection.query(
-                            query_texts=[cleaned_query],
                             query_embeddings=[q_emb],
                             n_results=n_results,
                             where=where_filter
@@ -308,7 +330,6 @@ class RAGService:
                 elif target_type and scope == "all":
                     try:
                         results = self.collection.query(
-                            query_texts=[cleaned_query],
                             query_embeddings=[q_emb],
                             n_results=n_results,
                             where=where_filter
@@ -319,7 +340,6 @@ class RAGService:
                     if not results or not results.get("ids") or not results["ids"][0]:
                         try:
                             results = self.collection.query(
-                                query_texts=[cleaned_query],
                                 query_embeddings=[q_emb],
                                 n_results=n_results,
                                 where={"status": "active"}
@@ -329,7 +349,6 @@ class RAGService:
                 else:
                     try:
                         results = self.collection.query(
-                            query_texts=[cleaned_query],
                             query_embeddings=[q_emb],
                             n_results=n_results,
                             where={"status": "active"}
@@ -340,7 +359,6 @@ class RAGService:
                 if not results or not results.get("ids") or not results["ids"][0]:
                     try:
                         results = self.collection.query(
-                            query_texts=[cleaned_query],
                             query_embeddings=[q_emb],
                             n_results=n_results
                         )
@@ -356,22 +374,38 @@ class RAGService:
 
         retrieved_ids = []
         retrieved_distances = {}
-        if results and "ids" in results and results["ids"]:
-            for id_str, dist in zip(results["ids"][0], results["distances"][0]):
-                item_id = int(id_str)
-                retrieved_ids.append(item_id)
-                # In ChromaDB cosine space: distance in [0, 2], similarity = 1 - (dist / 2)
-                similarity = max(0.0, min(1.0, 1.0 - (dist / 2.0)))
-                retrieved_distances[item_id] = similarity
+        try:
+            if results and isinstance(results, dict) and results.get("ids") and len(results["ids"]) > 0:
+                id_list = results["ids"][0] or []
+                dist_list = (results.get("distances") or [[]])[0] if results.get("distances") else []
+                for idx, id_str in enumerate(id_list):
+                    try:
+                        item_id = int(id_str)
+                        retrieved_ids.append(item_id)
+                        if idx < len(dist_list) and dist_list[idx] is not None:
+                            dist = float(dist_list[idx])
+                            # In ChromaDB cosine space: distance in [0, 2], similarity = 1 - (dist / 2)
+                            similarity = max(0.0, min(1.0, 1.0 - (dist / 2.0)))
+                        else:
+                            similarity = 0.5
+                        retrieved_distances[item_id] = similarity
+                    except (ValueError, TypeError):
+                        continue
+        except Exception as e:
+            print(f"Notice: Result distance parsing exception: {e}")
 
         if not retrieved_ids or not db_conn:
             return self._fallback_sqlite_search(cleaned_query, target_type, top_k, db_conn)
 
         # Retrieve authoritative SQLite database records
-        cursor = db_conn.cursor()
-        placeholders = ",".join("?" for _ in retrieved_ids)
-        cursor.execute(f"SELECT * FROM items WHERE id IN ({placeholders}) AND status = 'active'", retrieved_ids)
-        db_items = [dict(row) for row in cursor.fetchall()]
+        try:
+            cursor = db_conn.cursor()
+            placeholders = ",".join("?" for _ in retrieved_ids)
+            cursor.execute(f"SELECT * FROM items WHERE id IN ({placeholders}) AND status = 'active'", retrieved_ids)
+            db_items = [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"Notice: Authoritative record retrieval error: {e}")
+            return self._fallback_sqlite_search(cleaned_query, target_type, top_k, db_conn)
 
         if not db_items:
             return self._fallback_sqlite_search(cleaned_query, target_type, top_k, db_conn)

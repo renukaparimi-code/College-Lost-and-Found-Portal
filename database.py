@@ -5,9 +5,21 @@ import config
 
 DATABASE = config.DATABASE
 
+def ensure_db_dir(db_path: str):
+    """Safely ensures the parent directory for the SQLite database exists."""
+    if not db_path or db_path == ":memory:":
+        return
+    try:
+        dir_name = os.path.dirname(os.path.abspath(db_path))
+        if dir_name and not os.path.exists(dir_name):
+            os.makedirs(dir_name, exist_ok=True)
+    except OSError as e:
+        print(f"Warning: Could not create directory for database '{db_path}': {e}")
+
 def get_db_connection():
     # Resolves dynamically to allow test monkeypatching of database.DATABASE or config.DATABASE
     db_path = globals().get('DATABASE') or getattr(config, 'DATABASE', 'lost_found.db')
+    ensure_db_dir(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
