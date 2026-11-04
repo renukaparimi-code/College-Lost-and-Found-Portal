@@ -79,9 +79,10 @@ def test_rag_service_handles_readonly_filesystem():
 
     with patch("os.makedirs", side_effect=OSError(30, "Read-only file system")):
         service = rag_service.RAGService(chroma_path="/var/task/read_only_chroma", in_memory=False)
+        col = service.collection
         assert service.in_memory is True
         assert service.client is not None
-        assert service.collection is not None
+        assert col is not None
 
 
 def test_chroma_collection_no_onnx_download():

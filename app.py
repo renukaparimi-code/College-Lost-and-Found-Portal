@@ -25,18 +25,12 @@ def is_admin_request() -> bool:
         return False
     return hmac.compare_digest(header_key.strip(), expected_key.strip())
 
-# Initialize database and vector store on startup
+# Initialize database on startup
 with app.app_context():
     try:
         database.init_db()
     except Exception as e:
         print(f"Warning: Database initialization deferred: {e}")
-    try:
-        conn = get_db()
-        rag_service_instance.sync_all_from_db(conn)
-        conn.close()
-    except Exception as e:
-        print(f"Warning: Vector store sync deferred: {e}")
 
 # Static file routes
 @app.route('/')

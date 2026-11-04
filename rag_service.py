@@ -20,7 +20,22 @@ class RAGService:
         self.in_memory = in_memory
         self.matcher = HybridAIMatcher()
         self.vectorizer = HashingVectorizer(n_features=384, norm='l2', alternate_sign=False)
-        self._init_chroma()
+        self.client = None
+        self._collection = None
+        # In test environments with in_memory=True, initialize immediately
+        if self.in_memory or self.chroma_path == ":memory:":
+            self._init_chroma()
+
+    @property
+    def collection(self):
+        """Lazy loads Chroma collection inside the active worker process to prevent Gunicorn fork deadlocks."""
+        if self._collection is None:
+            self._init_chroma()
+        return self._collection
+
+    @collection.setter
+    def collection(self, val):
+        self._collection = val
 
     def embed_text(self, text: str) -> list:
         """Generates a fast normalized 384-dimensional semantic embedding with domain expansion."""
@@ -44,9 +59,9 @@ class RAGService:
                 os.makedirs(self.chroma_path, exist_ok=True)
                 persistent_settings = Settings(anonymized_telemetry=False, is_persistent=True)
                 self.client = chromadb.PersistentClient(path=self.chroma_path, settings=persistent_settings)
-            except OSError as e:
+            except (OSError, Exception) as e:
                 # E.g. Errno 30 Read-only file system or permission error
-                print(f"Warning: Chroma storage path '{self.chroma_path}' not writable ({e}). Using in-memory client.")
+                print(f"Warning: Chroma storage path '{self.chroma_path}' not accessible ({e}). Using in-memory client.")
                 self.in_memory = True
                 self.client = chromadb.EphemeralClient(settings=settings)
 
